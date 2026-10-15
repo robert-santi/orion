@@ -1,0 +1,32 @@
+ORION — desempenho dos jogos
+================================
+
+Abra o atalho ORION.lnk nesta pasta, ou dist\ORION\ORION.exe.
+Enquanto o .exe não existir, use: python main.py
+
+A primeira tela só tem Verificar Agora. As outras seções abrem
+depois que essa leitura termina. Ela não muda o PC sozinha.
+
+A tela não tem conversa. A leitura marca as correções neste computador.
+Quando a verificação interna está disponível, ela também entra nessa
+leitura, sem aparecer para o jogador. Se ela não responder, valem as
+regras do programa. O arquivo em data\models, quando existe, é só reserva.
+
+Na aba Correções, o que estiver marcado só é aplicado depois de um
+ponto de restauração do Windows. Se o ponto falhar, nada é modificado.
+O Windows pede permissão de administrador nessa hora.
+
+A aba Debloat tira anúncio, aplicativo e serviço que não são necessários
+para o Windows iniciar. Defender e Windows Update não entram nessa lista.
+Também só aplica depois do ponto de restauração.
+
+Arquivos do CS2 e do Rocket League ficam em Documentos e na pasta da Steam.
+A Restauração do Sistema não cobre esses arquivos. O ORION guarda uma cópia
+em data\backups antes de gravar. O botão de desfazer usa essa cópia.
+
+Ao abrir, o ORION compara esta instalação com a versão publicada.
+Não é preciso colar endereço. A pasta data\ (cópias, histórico e
+configurações deste computador) é preservada. A atualização automática
+vem ligada e pode ser desligada em Configurações.
+
+Para gerar o .exe de novo: powershell -ExecutionPolicy Bypass -File build.ps1

@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+**/__pycache__/
+build/
+dist/
+*.spec
+.env
+data/config.json
+data/history/
+data/logs/
+data/backups/
+data/plans/
+*.lnk
+data/models/
+data/updates/
+data/tools/
+data/update_state.json
