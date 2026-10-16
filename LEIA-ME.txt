@@ -24,6 +24,11 @@ Arquivos do CS2 e do Rocket League ficam em Documentos e na pasta da Steam.
 A Restauração do Sistema não cobre esses arquivos. O ORION guarda uma cópia
 em data\backups antes de gravar. O botão de desfazer usa essa cópia.
 
+A seção Cuidados, depois da verificação, mostra disco, inicialização,
+programas, rede, tela e um relatório em texto. A limpeza começa
+desmarcada. Defender e Windows Update só aparecem como leitura.
+Pastas de outros usuários ficam de fora.
+
 Ao abrir, o ORION compara esta instalação com a versão publicada.
 Não é preciso colar endereço. A pasta data\ (cópias, histórico e
 configurações deste computador) é preservada. A atualização automática

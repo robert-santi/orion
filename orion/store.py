@@ -14,6 +14,7 @@ DEFAULTS = {
     "auto_update": True,
     "git_token": "",
     "profile_override": "",
+    "use_mode": "jogos",
 }
 OVERRIDES = {"", "fraco", "equilibrado", "forte"}
 
@@ -53,6 +54,7 @@ def load_settings() -> dict:
         "auto_update": auto_update,
         "git_token": str(data.get("git_token") or "").strip(),
         "profile_override": override if override in OVERRIDES else "",
+        "use_mode": normalize_use(str(data.get("use_mode") or "")),
     }
 
 
@@ -69,7 +71,15 @@ def save_settings(settings: dict) -> None:
     if "profile_override" in settings:
         override = str(settings.get("profile_override") or "")
         data["profile_override"] = override if override in OVERRIDES else ""
+    if "use_mode" in settings:
+        data["use_mode"] = normalize_use(str(settings.get("use_mode") or ""))
     save_config(data)
+
+
+def normalize_use(value: str) -> str:
+    from orion.scanner.care import normalize_use_mode
+
+    return normalize_use_mode(value)
 
 
 def save_history(snapshot: Snapshot, score: int, headline: str, profile: str = "") -> None:

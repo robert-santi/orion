@@ -103,9 +103,39 @@ def _check_debloat() -> list[str]:
     return []
 
 
+def _check_care() -> list[str]:
+    import os
+    from pathlib import Path
+
+    from orion.scanner.care import cleanup_root_kind, compare_history, normalize_use_mode
+
+    errors = []
+    if cleanup_root_kind(Path(r"C:\Users\Casal\AppData\Local\Temp")) != "":
+        errors.append("limpeza aceitou outro usuário")
+    if cleanup_root_kind(Path(r"C:\Windows\Temp")) != "":
+        errors.append("limpeza aceitou a pasta do Windows")
+    temp = Path(os.environ.get("TEMP") or "")
+    if not temp or cleanup_root_kind(temp) != "temp":
+        errors.append("a Temp deste usuário foi recusada")
+    if cleanup_root_kind(Path(r"D:\SteamLibrary\steamapps\shadercache\730")) != "steam":
+        errors.append("shader da Steam foi recusado")
+    if normalize_use_mode("compartilhado") != "compartilhado" or normalize_use_mode("outro") != "jogos":
+        errors.append("perfil de uso")
+    compared = compare_history(
+        [
+            {"score": 70, "scanned_at": "agora", "issues": [{"title": "Novo"}, {"title": "Igual"}]},
+            {"score": 60, "scanned_at": "antes", "issues": [{"title": "Igual"}, {"title": "Antigo"}]},
+        ]
+    )
+    if compared.get("added") != ["Novo"] or compared.get("gone") != ["Antigo"]:
+        errors.append(f"comparação de verificações: {compared}")
+    return errors
+
+
 def run_selftest() -> int:
     errors = _check_editors()
     errors.extend(_check_product())
+    errors.extend(_check_care())
     errors.extend(_check_debloat())
     print("Editores e regras:", "ok" if not errors else errors)
     if errors:
@@ -115,6 +145,16 @@ def run_selftest() -> int:
         return 1
     snapshot = run_scan(lambda message: print(".", message, flush=True))
     report = analyze(snapshot)
+    from orion.scanner.care import render_report
+
+    class _Verdict:
+        summary = report.headline
+
+    report_text = render_report(snapshot, report, _Verdict(), "jogos")
+    lowered = report_text.lower()
+    if "gemini" in lowered or "grok" in lowered or "fps:" in lowered:
+        print("FALHOU: relatório com texto indevido")
+        return 1
     names = [game.name for game in snapshot.games]
     print("\nPC:", snapshot.cpu_name.strip())
     print("GPU:", ", ".join(gpu.name for gpu in snapshot.gpus) or "nenhuma")

@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 
 import customtkinter as ctk
+from customtkinter.windows.widgets.ctk_scrollable_frame import CTkScrollableFrame
+from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker
 from PIL import Image
 
 from orion import __version__
@@ -26,9 +28,57 @@ from orion.fixer.elevate import launch_elevated
 from orion.models import GameEntry, Issue, Snapshot
 from orion.paths import data_dir, resource_path
 from orion.scanner.engine import run_scan
+from orion.scanner.care import USE_LABELS, normalize_use_mode, ping_line
 from orion.store import list_history, load_settings, save_history, save_settings
 from orion.updater import install, look_up, remember_sha, worktree_dirty
 from orion.winutil import is_admin
+
+# The DPI poll calls window.state() every 100 ms. During a drag that call
+# re-enters the move loop and the window stops following the cursor.
+ctk.deactivate_automatic_dpi_awareness()
+ScalingTracker.update_loop_running = True
+
+
+def _scaling_poll_disabled(cls) -> None:
+    return
+
+
+ScalingTracker.check_dpi_scaling = classmethod(_scaling_poll_disabled)
+
+
+def _scroll_configure(self, event) -> None:
+    size = (int(event.width), int(event.height))
+    if size == getattr(self, "_orion_cfg", None):
+        return
+    self._orion_cfg = size
+    try:
+        box = self._parent_canvas.bbox("all")
+    except tk.TclError:
+        return
+    if box is not None:
+        self._parent_canvas.configure(scrollregion=box)
+
+
+def _fit_scroll_frame(self, event) -> None:
+    if self._orientation == "horizontal":
+        if event.height > 1:
+            self._parent_canvas.itemconfigure(self._create_window_id, height=event.height)
+        return
+    if event.width > 1:
+        self._parent_canvas.itemconfigure(self._create_window_id, width=event.width)
+
+
+_original_scroll_init = CTkScrollableFrame.__init__
+
+
+def _scroll_init(self, *args, **kwargs):
+    _original_scroll_init(self, *args, **kwargs)
+    self.unbind("<Configure>")
+    self.bind("<Configure>", lambda event, frame=self: _scroll_configure(frame, event))
+
+
+CTkScrollableFrame.__init__ = _scroll_init
+CTkScrollableFrame._fit_frame_dimensions_to_canvas = _fit_scroll_frame
 
 ctk.set_appearance_mode("dark")
 log = logging.getLogger("orion")
@@ -58,6 +108,7 @@ SEVERITY_COLOR = {
 NAV = (
     ("Início", "inicio"),
     ("Computador", "computador"),
+    ("Cuidados", "cuidados"),
     ("Jogos", "jogos"),
     ("Resultados", "resultados"),
     ("Correções", "correcoes"),
@@ -71,6 +122,12 @@ PROFILE_MENU = (
     ("PC fraco", "fraco"),
     ("Equilibrado", "equilibrado"),
     ("PC forte", "forte"),
+)
+USE_MENU = (
+    ("Jogos", "jogos"),
+    ("Escritório", "escritorio"),
+    ("Uso leve", "leve"),
+    ("PC compartilhado", "compartilhado"),
 )
 
 
@@ -99,11 +156,18 @@ class OrionApp(ctk.CTk):
         self.debloat_token = 0
         self.verification_lines: list[str] = []
         self._awaiting_apply: dict | None = None
+        self.care: dict | None = None
+        self.care_token = 0
+        self.care_loading = False
+        self.care_section = "disco"
+        self.care_checks: set[str] = set()
+        self.care_lines = ""
         self.nav_buttons: dict[str, ctk.CTkButton] = {}
         self._logo = None
         self._prepare_brand()
         self._build()
         self.show_page("entrada")
+        self._install_drag_guard()
         self.after(1800, self._kick_model)
         self.after(2200, self._maybe_auto_update)
 
@@ -144,8 +208,8 @@ class OrionApp(ctk.CTk):
             text_color=GOLD,
         ).pack(side="left")
         ctk.CTkFrame(side, height=2, fg_color=GOLD).pack(fill="x", padx=22, pady=(10, 8))
-        ctk.CTkLabel(side, text="Desempenho dos jogos", text_color=MUTED, font=ctk.CTkFont(size=12)).pack(
-            anchor="w", padx=22, pady=(0, 18)
+        ctk.CTkLabel(side, text="O computador e os jogos", text_color=MUTED, font=ctk.CTkFont(size=12)).pack(
+            anchor="w", padx=22, pady=(0, 12)
         )
         for label, page_id in NAV:
             button = ctk.CTkButton(
@@ -155,7 +219,8 @@ class OrionApp(ctk.CTk):
                 fg_color="transparent",
                 hover_color="#1c1a17",
                 text_color=MUTED,
-                height=40,
+                height=34,
+                corner_radius=12,
                 command=lambda page=page_id: self.show_page(page),
             )
             button.pack(fill="x", padx=12, pady=2)
@@ -174,7 +239,15 @@ class OrionApp(ctk.CTk):
         self.content.grid_columnconfigure(0, weight=1)
         self.content.grid_rowconfigure(0, weight=1)
         self.status = ctk.CTkLabel(self, text="Pronto. A verificação só lê o computador.", text_color=MUTED, anchor="w")
-        self.status.grid(row=1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 10))
+        self.status.grid(row=1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 4))
+        self.progress = ctk.CTkProgressBar(self, height=8, corner_radius=8, progress_color=GOLD, fg_color="#1c1a17")
+        self.progress.grid(row=2, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 12))
+        self.progress.set(0)
+        self._progress_job = None
+        self._pulse = 0.12
+        self._drag_at = 0.0
+        self._win_pos = None
+        self.bind("<Configure>", self._note_window_move, add="+")
 
     def _refresh_admin(self) -> None:
         if is_admin():
@@ -194,9 +267,101 @@ class OrionApp(ctk.CTk):
                 text_color=GOLD if active else TEXT,
             )
 
+    def _install_drag_guard(self) -> None:
+        """Skip repaints while the title bar is dragged.
+
+        One full redraw of this window takes tens of milliseconds. Windows asks
+        for a new frame on every mouse step, so a fast drag falls behind.
+        """
+        if getattr(self, "_drag_proc", None) is not None:
+            return
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.GetParent.restype = ctypes.c_void_p
+        user32.GetAncestor.restype = ctypes.c_void_p
+        user32.GetDesktopWindow.restype = ctypes.c_void_p
+        hwnd = user32.GetAncestor(self.winfo_id(), 2) or user32.GetParent(self.winfo_id())
+        if not hwnd or hwnd == user32.GetDesktopWindow():
+            return
+        result = ctypes.c_ssize_t
+        callback_type = ctypes.WINFUNCTYPE(result, ctypes.c_void_p, ctypes.c_uint, ctypes.c_ssize_t, ctypes.c_ssize_t)
+        user32.CallWindowProcW.restype = result
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_ssize_t, ctypes.c_ssize_t]
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_ssize_t, ctypes.c_ssize_t]
+        user32.RedrawWindow.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+
+        def proc(window, msg, wparam, lparam):
+            if msg == 0x0231:  # WM_ENTERSIZEMOVE
+                self._window_drag = True
+                self._drag_sessions = getattr(self, "_drag_sessions", 0) + 1
+                user32.SendMessageW(window, 0x000B, 0, 0)  # WM_SETREDRAW
+            elif msg == 0x0232:  # WM_EXITSIZEMOVE
+                self._window_drag = False
+                user32.SendMessageW(window, 0x000B, 1, 0)
+                user32.RedrawWindow(window, None, None, 0x0185)
+            return user32.CallWindowProcW(self._drag_old, window, msg, wparam, lparam)
+
+        self._drag_proc = callback_type(proc)
+        self._drag_hwnd = hwnd
+        self._drag_old = user32.SetWindowLongPtrW(hwnd, -4, ctypes.cast(self._drag_proc, ctypes.c_void_p))
+        self._window_drag = False
+        self._drag_sessions = 0
+
+    def _remove_drag_guard(self) -> None:
+        old = getattr(self, "_drag_old", None)
+        hwnd = getattr(self, "_drag_hwnd", None)
+        if not old or not hwnd:
+            return
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW(hwnd, -4, old)
+        self._drag_old = None
+        self._drag_proc = None
+
+    def destroy(self) -> None:
+        self._remove_drag_guard()
+        super().destroy()
+
+    def _update_dimensions_event(self, event=None) -> None:
+        # A move sends Configure with the same size. Asking winfo_width() there
+        # blocks the Windows drag loop, so only a real resize is forwarded.
+        if getattr(self, "_window_drag", False):
+            return
+        if event is not None and getattr(event, "widget", None) is self:
+            width = int(getattr(event, "width", 0) or 0)
+            height = int(getattr(event, "height", 0) or 0)
+            if width > 1 and height > 1:
+                same_width = round(self._reverse_window_scaling(width)) == round(self._current_width)
+                same_height = round(self._reverse_window_scaling(height)) == round(self._current_height)
+                if same_width and same_height:
+                    return
+        super()._update_dimensions_event(event)
+
     def show_page(self, name: str) -> None:
         if not self.unlocked and name != "entrada":
             return
+        for sequence in (
+            "<MouseWheel>",
+            "<Button-4>",
+            "<Button-5>",
+            "<KeyPress-Shift_L>",
+            "<KeyPress-Shift_R>",
+            "<KeyRelease-Shift_L>",
+            "<KeyRelease-Shift_R>",
+        ):
+            self.unbind_all(sequence)
+        local_bar = getattr(self, "care_local_bar", None)
+        if local_bar is not None:
+            try:
+                local_bar.stop()
+            except Exception:
+                pass
         self.page = name
         self._paint_nav()
         for child in self.content.winfo_children():
@@ -205,6 +370,7 @@ class OrionApp(ctk.CTk):
             "entrada": self._page_entry,
             "inicio": self._page_home,
             "computador": self._page_pc,
+            "cuidados": self._page_care,
             "jogos": self._page_games,
             "resultados": self._page_issues,
             "correcoes": self._page_fixes,
@@ -223,6 +389,84 @@ class OrionApp(ctk.CTk):
                     label.configure(text=text)
             except tk.TclError:
                 pass
+        self._advance_progress(text)
+
+    def _note_window_move(self, event) -> None:
+        if event.widget is not self:
+            return
+        pos = (event.x, event.y)
+        if pos != self._win_pos:
+            self._win_pos = pos
+            self._drag_at = time.monotonic()
+
+    def _cancel_pulse(self) -> None:
+        job = self._progress_job
+        self._progress_job = None
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except (tk.TclError, ValueError):
+                pass
+
+    def _progress_begin(self) -> None:
+        if self._progress_job is not None:
+            return
+        self._pulse = 0.18
+        try:
+            self.progress.set(self._pulse)
+        except tk.TclError:
+            return
+        self._progress_job = self.after(500, self._progress_pulse)
+
+    def _progress_pulse(self) -> None:
+        self._progress_job = None
+        if not self.winfo_exists():
+            return
+        if not self.scanning and not self.care_loading and not self.applying:
+            return
+        if time.monotonic() - self._drag_at < 0.45:
+            self._progress_job = self.after(500, self._progress_pulse)
+            return
+        self._pulse = 0.18 if self._pulse >= 0.82 else self._pulse + 0.12
+        try:
+            self.progress.set(self._pulse)
+        except tk.TclError:
+            return
+        self._progress_job = self.after(500, self._progress_pulse)
+
+    def _progress_set(self, value: float) -> None:
+        self._cancel_pulse()
+        try:
+            self.progress.set(max(0.0, min(1.0, value)))
+        except tk.TclError:
+            pass
+
+    def _progress_end(self) -> None:
+        if self.scanning:
+            return
+        self._cancel_pulse()
+        try:
+            self.progress.set(1)
+        except tk.TclError:
+            return
+        self.after(700, lambda: self.progress.set(0) if self.winfo_exists() and not self.scanning and not self.care_loading else None)
+
+    def _advance_progress(self, text: str) -> None:
+        if not self.scanning:
+            return
+        folded = text.lower()
+        for token, value in (
+            ("processador", 0.16),
+            ("uso de cpu", 0.34),
+            ("steam", 0.52),
+            ("configura", 0.68),
+            ("latência", 0.82),
+            ("latencia", 0.82),
+            ("conferindo", 0.94),
+        ):
+            if token in folded:
+                self._progress_set(value)
+                return
 
     def _kick_model(self) -> None:
         if os.environ.get("ORION_SKIP_MODEL") == "1":
@@ -299,6 +543,7 @@ class OrionApp(ctk.CTk):
             except tk.TclError:
                 pass
         self._set_status("Lendo bibliotecas e o hardware. Nada está sendo alterado.")
+        self._progress_begin()
         threading.Thread(target=lambda: self._scan_worker(token), daemon=True).start()
 
     def _scan_worker(self, token: int) -> None:
@@ -318,6 +563,7 @@ class OrionApp(ctk.CTk):
 
     def _scan_failed(self, message: str) -> None:
         self.scanning = False
+        self._progress_end()
         self._set_status("A verificação não terminou.")
         button = getattr(self, "verify_button", None)
         if button is not None:
@@ -337,6 +583,7 @@ class OrionApp(ctk.CTk):
         self.analysis = report
         self.verdict = verdict
         self.scanning = False
+        self._progress_end()
         if pending is not None:
             self.verification_lines = verify_corrections(
                 pending["before"],
@@ -366,15 +613,16 @@ class OrionApp(ctk.CTk):
         ctk.CTkLabel(box, text="ORION", font=ctk.CTkFont(family="Segoe UI", size=54, weight="bold"), text_color=GOLD).pack()
         ctk.CTkLabel(
             box,
-            text="Desempenho dos jogos neste computador.",
+            text="Uma leitura deste computador e dos jogos.",
             text_color=TEXT,
             font=ctk.CTkFont(size=18),
         ).pack(pady=(8, 22))
         self.verify_button = ctk.CTkButton(
             box,
             text="Verificar Agora",
-            width=280,
-            height=54,
+            width=300,
+            height=56,
+            corner_radius=28,
             fg_color=GOLD,
             hover_color="#e2c79a",
             text_color=GOLD_TEXT,
@@ -414,6 +662,13 @@ class OrionApp(ctk.CTk):
         text.pack(side="left", fill="both", expand=True)
         chip = PROFILE_LABEL.get(verdict.profile, verdict.profile)
         ctk.CTkLabel(text, text=chip.upper(), text_color=GOLD, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w")
+        use_mode = normalize_use_mode(load_settings().get("use_mode") or "")
+        use_line = f"Uso deste PC: {USE_LABELS.get(use_mode, 'Jogos')}."
+        if use_mode in {"escritorio", "leve"}:
+            use_line += " As correções de jogo continuam na aba Correções."
+        if use_mode == "compartilhado":
+            use_line += " Outras contas ficam fora das pastas lidas."
+        ctk.CTkLabel(text, text=use_line, text_color=MUTED, wraplength=760, justify="left").pack(anchor="w", pady=(4, 0))
         ctk.CTkLabel(
             text, text=report.headline, text_color=TEXT, font=ctk.CTkFont(size=18, weight="bold"), wraplength=760, justify="left"
         ).pack(anchor="w", pady=(6, 0))
@@ -458,6 +713,12 @@ class OrionApp(ctk.CTk):
             )
             for line in snap.healthy[:4]:
                 ctk.CTkLabel(frame, text="• " + line, text_color=TEXT, wraplength=860, justify="left").pack(anchor="w")
+        if snap.network:
+            ctk.CTkLabel(frame, text="Rede, separada da nota", text_color=GOLD, font=ctk.CTkFont(size=16, weight="bold")).pack(
+                anchor="w", pady=(12, 4)
+            )
+            for item in snap.network:
+                ctk.CTkLabel(frame, text=ping_line(item), text_color=TEXT).pack(anchor="w")
         if snap.notes:
             ctk.CTkLabel(
                 frame, text="Avisos da leitura: " + " | ".join(snap.notes), text_color=WARN, wraplength=860, justify="left"
@@ -952,7 +1213,20 @@ class OrionApp(ctk.CTk):
             if payload.get("reboot"):
                 lines.append("Uma das mudanças só vale depois de reiniciar o Windows. O ORION não reinicia sozinho.")
             text = "\n".join(lines) or "Sem detalhes."
-            if sink == "debloat":
+            if sink == "care":
+                self._append_care(text + "\n")
+                self.care = None
+                self.care_loading = False
+                self._progress_end()
+                if payload.get("aborted"):
+                    self._set_status("O ponto de restauração não foi criado. Nada foi alterado.")
+                elif payload.get("ok"):
+                    self._set_status("Cuidado concluído.")
+                else:
+                    self._set_status("O cuidado parou ou teve falha. Veja o registro.")
+                if self.page == "cuidados":
+                    self.show_page("cuidados")
+            elif sink == "debloat":
                 self._append_debloat(text + "\n")
                 if payload.get("aborted"):
                     self._set_status("O ponto de restauração não foi criado. Nada foi alterado.")
@@ -988,6 +1262,196 @@ class OrionApp(ctk.CTk):
                     box.see("end")
             except tk.TclError:
                 pass
+
+    def _append_care(self, text: str) -> None:
+        self.care_lines += text
+        box = getattr(self, "care_log", None)
+        if box is not None:
+            try:
+                if box.winfo_exists():
+                    box.insert("end", text)
+                    box.see("end")
+            except tk.TclError:
+                pass
+
+    def _page_care(self) -> None:
+        from orion.ui.care_page import build_care
+
+        build_care(self)
+
+    def _submit_care(self, plan: dict, question: str) -> None:
+        if self.applying:
+            return
+        if not messagebox_yesno(question):
+            return
+        folder = data_dir() / "plans"
+        folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        plan_path = folder / f"care-{stamp}.json"
+        result_path = folder / f"care-{stamp}-result.json"
+        plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.applying = True
+        self._progress_begin()
+        self._set_status("Criando ponto de restauração antes da mudança. Pode levar um minuto.")
+        self._append_care("Pedido enviado. O Windows pede permissão de administrador se ainda não estiver elevada.\n")
+        if is_admin():
+            threading.Thread(target=lambda: apply_file(plan_path, result_path), daemon=True).start()
+        else:
+            ok, message = launch_elevated(f'--apply "{plan_path}" --result "{result_path}"')
+            if not ok:
+                self.applying = False
+                self._progress_end()
+                self._append_care(message + "\n")
+                self._set_status(message)
+                return
+        self._poll_deadline = time.time() + 240
+        self.after(600, lambda path=result_path: self._poll_result(path, False, "care"))
+
+    def _care_cleanup(self) -> None:
+        chosen = [item for item in ("temp", "recycle", "shader_user", "shader_steam") if item in self.care_checks]
+        if not chosen:
+            messagebox_info("Marque ao menos uma limpeza. Todas começam desmarcadas.")
+            return
+        labels = {
+            "temp": "Temp deste usuário",
+            "recycle": "Lixeira deste usuário",
+            "shader_user": "Caches de shader deste usuário",
+            "shader_steam": "Shaders da Steam dos jogos encontrados",
+        }
+        paths = []
+        for item in (self.care or {}).get("shaders") or []:
+            scope = item.get("scope")
+            if scope == "user" and "shader_user" in chosen:
+                paths.append(item.get("path"))
+            if scope == "steam" and "shader_steam" in chosen:
+                paths.append(item.get("path"))
+        listed = "\n".join(labels[item] for item in chosen)
+        self._submit_care(
+            {"kind": "care", "cleanup": chosen, "shader_paths": paths},
+            "Vou criar um ponto de restauração e, só se ele for criado, limpar:\n\n"
+            f"{listed}\n\n"
+            "Arquivo temporário e cache de shader não voltam com esse ponto. "
+            "Se o shader for limpo, a primeira partida pode engasgar.\n\nContinuar?",
+        )
+
+    def _care_startup(self) -> None:
+        allowed = {
+            item.get("name")
+            for item in (self.care or {}).get("startups") or []
+            if item.get("can_disable")
+        }
+        names = []
+        for key in self.care_checks:
+            if not key.startswith("startup:"):
+                continue
+            name = key.split(":", 1)[1]
+            if name in allowed:
+                names.append(name)
+        if not names:
+            messagebox_info("Marque um item de inicialização deste usuário.")
+            return
+        self._submit_care(
+            {"kind": "care", "startup_names": names},
+            "Vou criar um ponto de restauração e, só se ele for criado, tirar da inicialização deste usuário:\n\n"
+            + "\n".join(names)
+            + "\n\nDefender e Windows Update não entram. Dá para desfazer pelo backup do ORION.\n\nContinuar?",
+        )
+
+    def _care_restore_only(self) -> None:
+        self._submit_care(
+            {"kind": "care", "only_restore": True},
+            "Criar um ponto de restauração agora, sem mudar mais nada?\n\nO Windows pede permissão de administrador. Pode levar um minuto.",
+        )
+
+    def _care_discord(self, mode: str) -> None:
+        verb = "pausar" if mode == "off" else "devolver"
+        self._submit_care(
+            {"kind": "care", "discord": mode},
+            f"Vou criar um ponto de restauração e, só se ele for criado, {verb} a sobreposição do Discord.\n\n"
+            "A voz continua. Feche e abra o Discord para ele ler a mudança.\n\nContinuar?",
+        )
+
+    def _care_ping(self) -> None:
+        if self.scanning:
+            return
+        self._progress_begin()
+        self._set_status("Medindo o ping. Isso não entra na nota e não é FPS.")
+        threading.Thread(target=self._care_ping_worker, daemon=True).start()
+
+    def _care_ping_worker(self) -> None:
+        from orion.scanner.network import probe
+
+        try:
+            rows = probe()
+            error = ""
+        except Exception as error_value:
+            rows = []
+            error = str(error_value)
+        self.after(0, lambda: self._care_ping_done(rows, error))
+
+    def _care_ping_done(self, rows: list, error: str) -> None:
+        self._progress_end()
+        if error:
+            self._set_status("O ping não terminou.")
+            messagebox_info(error)
+            return
+        if self.care is not None:
+            self.care["network"] = rows
+        self._set_status("Ping medido de novo.")
+        if self.page == "cuidados":
+            self.care_section = "rede"
+            self.show_page("cuidados")
+
+    def _care_export_report(self) -> None:
+        if not self.snapshot or not self.analysis or not self.verdict:
+            messagebox_info("Faça a verificação antes de salvar o relatório.")
+            return
+        from tkinter import filedialog
+
+        from orion.scanner.care import render_report
+
+        destination = filedialog.asksaveasfilename(
+            title="Salvar relatório",
+            defaultextension=".txt",
+            filetypes=[("Texto", "*.txt")],
+            initialfile="ORION-relatorio.txt",
+        )
+        if not destination:
+            return
+        text = render_report(self.snapshot, self.analysis, self.verdict, load_settings().get("use_mode") or "")
+        Path(destination).write_text(text, encoding="utf-8")
+        self._set_status("Relatório salvo.")
+        self._append_care(f"Relatório salvo em {destination}\n")
+
+    def _care_export_configs(self) -> None:
+        if not self.snapshot:
+            return
+        import zipfile
+        from tkinter import filedialog
+
+        configs = self.snapshot.configs or {}
+        files = []
+        for key, field in (("cs2", "video_path"), ("rocket_league", "ini_path")):
+            raw = (configs.get(key) or {}).get(field) or ""
+            path = Path(raw)
+            if path.is_file():
+                files.append(path)
+        if not files:
+            messagebox_info("Não encontrei o vídeo do CS2 nem o arquivo do Rocket League nesta leitura.")
+            return
+        destination = filedialog.asksaveasfilename(
+            title="Salvar cópia das configurações",
+            defaultextension=".zip",
+            filetypes=[("Zip", "*.zip")],
+            initialfile="ORION-configs.zip",
+        )
+        if not destination:
+            return
+        with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            for path in files:
+                bundle.write(path, path.name)
+        self._set_status("Cópia das configurações salva.")
+        self._append_care(f"Configs salvas em {destination}\n")
 
     def _append_log(self, text: str) -> None:
         self.fix_lines += text
@@ -1190,6 +1654,28 @@ class OrionApp(ctk.CTk):
             dropdown_fg_color=CARD,
             dropdown_text_color=TEXT,
         ).pack(anchor="w", pady=4)
+        ctk.CTkLabel(
+            frame,
+            text="O uso muda o texto e o que a seção Cuidados oferece. Não desmarca correção de jogo.",
+            text_color=MUTED,
+            wraplength=880,
+            justify="left",
+        ).pack(anchor="w", pady=(12, 4))
+        use_mode = normalize_use_mode(settings.get("use_mode") or "")
+        current_use = next((label for label, value in USE_MENU if value == use_mode), "Jogos")
+        self.use_choice = tk.StringVar(value=current_use)
+        ctk.CTkOptionMenu(
+            frame,
+            values=[label for label, _value in USE_MENU],
+            variable=self.use_choice,
+            fg_color=CARD,
+            button_color=GOLD,
+            button_hover_color="#e2c79a",
+            text_color=TEXT,
+            dropdown_fg_color=CARD,
+            dropdown_text_color=TEXT,
+            corner_radius=12,
+        ).pack(anchor="w", pady=4)
         row = ctk.CTkFrame(frame, fg_color=BG)
         row.pack(fill="x", pady=16)
         self._gold_button(row, "Salvar", self._save_settings_form, width=120).pack(side="left", padx=(0, 8))
@@ -1198,10 +1684,12 @@ class OrionApp(ctk.CTk):
     def _save_settings_form(self) -> None:
         label = self.profile_choice.get()
         override = next((value for name, value in PROFILE_MENU if name == label), "")
+        use_mode = next((value for name, value in USE_MENU if name == self.use_choice.get()), "jogos")
         save_settings(
             {
                 "auto_update": bool(self.auto_update.get()),
                 "profile_override": override,
+                "use_mode": use_mode,
             }
         )
         self._set_status("Configurações salvas neste computador.")
@@ -1283,7 +1771,8 @@ class OrionApp(ctk.CTk):
             parent,
             text=text,
             width=width,
-            height=36,
+            height=40,
+            corner_radius=18,
             fg_color=GOLD,
             hover_color="#e2c79a",
             text_color=GOLD_TEXT,
@@ -1294,7 +1783,8 @@ class OrionApp(ctk.CTk):
         return ctk.CTkButton(
             parent,
             text=text,
-            height=32,
+            height=36,
+            corner_radius=18,
             fg_color=GHOST,
             hover_color="#3a3226",
             text_color=GOLD if enabled else MUTED,

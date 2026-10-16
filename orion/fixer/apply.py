@@ -15,6 +15,10 @@ def apply_plan(plan: dict) -> dict:
         from orion.fixer.debloat import apply_debloat
 
         return apply_debloat(plan)
+    if plan.get("kind") == "care":
+        from orion.fixer.care import apply_care
+
+        return apply_care(plan)
     steps = []
     ok, message = create_restore_point("ORION antes da otimizacao")
     steps.append({"id": "restore_point", "ok": ok, "message": message})
